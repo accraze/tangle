@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to publish releases on tag pushes
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev \
+            libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl-dev
+
+      # rust-toolchain.toml selects the toolchain; this just makes sure fmt and clippy are present
+      - run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --release --workspace --lib
+      - run: cargo test --release --workspace --lib
+      - run: cargo xtask bundle tangle --release
+
+      # Loads the plugin like a host would: state save/load, param handling, threading rules
+      - name: Validate CLAP plugin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download 0.4.1 --repo free-audio/clap-validator --pattern '*ubuntu-22.04.zip' --dir "$RUNNER_TEMP"
+          # The release zip wraps a tarball
+          unzip -q "$RUNNER_TEMP"/clap-validator-*.zip -d "$RUNNER_TEMP/clap-validator"
+          tar -xzf "$RUNNER_TEMP"/clap-validator/*.tar.gz -C "$RUNNER_TEMP/clap-validator"
+          validator=$(find "$RUNNER_TEMP/clap-validator" -name clap-validator -type f)
+          chmod +x "$validator"
+          # These four also fail for nih-plug's own example plugins with validator 0.4.1 (they all
+          # pass on 0.3.2), so they're framework/validator mismatches rather than Tangle bugs
+          "$validator" validate --only-failed \
+            -x 'state-invalid-random' -x 'state-reproducibility-(basic|binary|buffered)' \
+            target/bundled/Tangle.clap
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tangle-linux
+          path: |
+            target/bundled/Tangle.clap
+            target/bundled/Tangle.vst3
+
+      # Pushing a v* tag publishes a release, using the annotated tag's message as the notes
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # checkout only fetches the lightweight ref, so fetch the annotated tag object for its message
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          zip_name="tangle-$GITHUB_REF_NAME-linux.zip"
+          (cd target/bundled && zip -qr "../../$zip_name" Tangle.clap Tangle.vst3)
+          zip -q "$zip_name" LICENSE
+          gh release create "$GITHUB_REF_NAME" "$zip_name" --title "Tangle $GITHUB_REF_NAME" --notes-from-tag
