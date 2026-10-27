@@ -13,7 +13,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 realfft = "3"
+tangle_core = { path = "core" }
 
 [profile.release]
 lto = "thin"
