@@ -124,7 +124,8 @@ impl Default for TangleParams {
                     max: MAX_QUBITS as i32,
                 },
             )
-            .with_value_to_string(Arc::new(|n| format!("{n} ({} bands)", 1 << n))),
+            .with_value_to_string(Arc::new(|n| format!("{n} ({} bands)", 1 << n)))
+            .with_string_to_value(Arc::new(|s| s.split_whitespace().next()?.parse().ok())),
             layers: IntParam::new(
                 "Layers",
                 2,
