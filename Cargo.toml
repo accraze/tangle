@@ -1,3 +1,20 @@
+[package]
+name = "tangle"
+version = "0.1.0"
+edition = "2021"
+description = "A spectral smear that mixes frequency bands through a simulated quantum circuit"
+license = "GPL-3.0-or-later"
+
 [workspace]
-members = ["core"]
-resolver = "2"
+members = ["xtask", "core"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+realfft = "3"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
