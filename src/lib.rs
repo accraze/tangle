@@ -12,6 +12,7 @@
 //!    each offset k, the vector of bin k from every band is multiplied by U. U is unitary, so this
 //!    keeps the frame's energy. Mix blends towards the identity in the spectrum, which equals a dry
 //!    blend; Transient Preserve pulls that blend down on each channel's attacks (`Detector`).
+//!    Octaves mode replaces this step with `shift_octaves`: U's index is the octave instead.
 //! 4. Inverse FFT and overlap-add.
 
 use nih_plug::prelude::*;
@@ -19,7 +20,7 @@ use nih_plug_egui::widgets::generic_ui::{self, GenericSlider};
 use nih_plug_egui::{create_egui_editor, egui, EguiState};
 use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 use tangle_core::{Angles, Unitary, MAX_DIM, MAX_LAYERS, MAX_QUBITS};
 
@@ -41,6 +42,18 @@ const TRANSIENT_RELEASE: f32 = 0.1;
 /// doesn't trigger
 const HFC_FLOOR: f32 = 1.0;
 
+/// Octaves mode: 3 qubits index 8 octaves, bins OCTAVE_BASE·2^b to OCTAVE_BASE·2^(b+1), which
+/// end exactly at TOP_BIN. That's every octave a 2048-point FFT can resolve, so the Qubits knob
+/// doesn't apply. Bins below OCTAVE_BASE (under ~94 Hz at 48 kHz) stay put.
+const OCTAVE_QUBITS: usize = 3;
+const OCTAVE_BASE: usize = 4;
+
+#[derive(Enum, PartialEq, Clone, Copy)]
+enum Mode {
+    Bands,
+    Octaves,
+}
+
 /// Knob values for one STFT frame
 #[derive(Clone, Copy, Default)]
 struct Settings {
@@ -59,6 +72,8 @@ struct Settings {
     /// Hz
     drift_rate: f32,
     transient: f32,
+    /// Octaves mode instead of Bands
+    octaves: bool,
 }
 
 impl Settings {
@@ -114,6 +129,173 @@ fn mix_bands(bins: &mut [Complex32], u: &Unitary, k_len: usize, mix: f32) {
     }
 }
 
+/// Per-channel phase vocoder state for Octaves mode, one entry per bin
+#[derive(Default)]
+struct Vocoder {
+    /// Each bin's phase in the previous frame, to measure its frequency
+    prev_phase: Vec<f32>,
+    /// Output phase of the moved partial whose peak landed on each bin: last frame's, and this
+    /// frame's being written
+    out_phase: Vec<f32>,
+    next_phase: Vec<f32>,
+    /// This frame's moved partials, and how much of each bin stays put
+    moved: Vec<Complex32>,
+    /// Amplitude of the loudest partial landing on each bin this frame. It alone advances that
+    /// bin's `out_phase`: a quieter partial (or a noise-floor peak) rounding to the same bin would
+    /// otherwise advance it at its own rate and detune the loud one.
+    loudest: Vec<f32>,
+    stay: Vec<f32>,
+    peaks: Vec<usize>,
+    /// `window_response` sampled every 1/WINDOW_STEPS bin over ±(LOBE + 1) bins
+    window: Vec<Complex32>,
+}
+
+impl Vocoder {
+    fn new() -> Self {
+        let bins = FFT_SIZE / 2 + 1;
+        Self {
+            prev_phase: vec![0.0; bins],
+            out_phase: vec![0.0; bins],
+            next_phase: vec![0.0; bins],
+            moved: vec![Complex32::new(0.0, 0.0); bins],
+            loudest: vec![0.0; bins],
+            stay: vec![1.0; bins],
+            peaks: Vec::with_capacity(bins),
+            window: (0..=2 * (LOBE + 1) * WINDOW_STEPS)
+                .map(|i| window_response(i as f32 / WINDOW_STEPS as f32 - (LOBE + 1) as f32))
+                .collect(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prev_phase.fill(0.0);
+        self.out_phase.fill(0.0);
+    }
+}
+
+/// `window_response(nu)` from `Vocoder::window`, for |nu| < LOBE + 1. The closed form is much
+/// slower, and this runs 9 times per moved partial per octave.
+fn window_at(table: &[Complex32], nu: f32) -> Complex32 {
+    let x = (nu + (LOBE + 1) as f32) * WINDOW_STEPS as f32;
+    let i = x as usize;
+    table[i] + (table[i + 1] - table[i]) * (x - i as f32)
+}
+
+/// Bins either side of a redrawn partial's centre. The sine window's main lobe is ±1.5 bins and
+/// its sidelobes fall off fast, so ±4 holds over 99.9% of the energy.
+const LOBE: usize = 4;
+/// Table resolution for `Vocoder::window_at`. Linear interpolation errs by about 1e-5.
+const WINDOW_STEPS: usize = 256;
+/// Energy of a redrawn unit partial's bins: N·Σw² by Parseval, a hair over what ±LOBE bins hold
+const WINDOW_ENERGY: f32 = (FFT_SIZE * FFT_SIZE / 2) as f32;
+
+/// The sqrt-Hann (sine) window's spectrum `nu` bins away from a partial, for a partial of
+/// amplitude 1 and phase 0 at the frame's first sample
+fn window_response(nu: f32) -> Complex32 {
+    use realfft::num_complex::Complex64;
+    let n = FFT_SIZE as f64;
+    // Sum of e^(i 2π a j / N) over j in 0..N
+    let sum = |a: f64| {
+        let den = Complex64::from_polar(1.0, std::f64::consts::TAU * a / n) - 1.0;
+        if den.norm() < 1e-12 {
+            Complex64::new(n, 0.0)
+        } else {
+            (Complex64::from_polar(1.0, std::f64::consts::TAU * a) - 1.0) / den
+        }
+    };
+    let nu = nu as f64;
+    // sin(πj/N) = (e^(iπj/N) - e^(-iπj/N)) / 2i
+    let w = (sum(0.5 - nu) - sum(-0.5 - nu)) / Complex64::new(0.0, 2.0);
+    Complex32::new(w.re as f32, w.im as f32)
+}
+
+fn octave(bin: usize) -> usize {
+    (bin / OCTAVE_BASE).ilog2() as usize
+}
+
+/// Octaves mode. U's index is the octave, and |U[r][c]|² is the share of each partial's energy
+/// that moves from octave c to octave r (the Born rule: U is unitary, so each column's shares sum
+/// to 1). The share that stays keeps its original bins, so U = I is exactly the identity.
+///
+/// Each spectral peak is a partial: the phase vocoder measures its true frequency, and dividing the
+/// peak bin by the window's response there gives its amplitude. Each moved copy is redrawn as the
+/// window's response centred on exactly 2^(r-c) times that frequency, with its phase advancing at
+/// that rate from frame to frame, so copies are in tune and keep their level. Whole-bin shifts
+/// can't do that: the copy's in-frame frequency stays off by the rounding, which detunes it.
+///
+/// shortcut: only peaks move, so the moved share of noisy, non-peak content (pick noise, breath)
+/// is dropped rather than moved; split off a residual and shift it too if that's audible.
+fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix: f32) {
+    // Phase a bin-centred partial advances per hop, per bin of frequency
+    let hop_phase = TAU * HOP as f32 / FFT_SIZE as f32;
+    pv.moved.fill(Complex32::new(0.0, 0.0));
+    pv.loudest.fill(0.0);
+    pv.stay.fill(1.0);
+    pv.next_phase.copy_from_slice(&pv.out_phase);
+
+    pv.peaks.clear();
+    for k in OCTAVE_BASE..=TOP_BIN {
+        let m = spectrum[k].norm_sqr();
+        let louder = |j: usize| spectrum[j].norm_sqr() > m;
+        let left = (k.saturating_sub(2).max(OCTAVE_BASE)..k)
+            .any(|j| louder(j) || spectrum[j].norm_sqr() == m);
+        let right = (k + 1..=(k + 2).min(TOP_BIN)).any(louder);
+        if m > 0.0 && !left && !right {
+            pv.peaks.push(k);
+        }
+    }
+
+    for (i, &p) in pv.peaks.iter().enumerate() {
+        let start = if i == 0 {
+            OCTAVE_BASE
+        } else {
+            (pv.peaks[i - 1] + p) / 2 + 1
+        };
+        let end = pv.peaks.get(i + 1).map_or(TOP_BIN, |&q| (p + q) / 2);
+        let phase = spectrum[p].arg();
+        let deviation = phase - pv.prev_phase[p] - hop_phase * p as f32;
+        // The partial's true frequency in bins, from how far its phase drifted off the bin centre.
+        // A sinusoid's loudest bin is within half a bin of it; noise peaks can claim more, and
+        // near the lobe's edge the amplitude below would blow up.
+        let offset = (deviation - TAU * (deviation / TAU).round()) / hop_phase;
+        let freq = p as f32 + offset.clamp(-0.5, 0.5);
+        // Half the partial's amplitude (the positive-frequency half of the sinusoid), capped so a
+        // redrawn copy never holds more energy than the region it stands for. Clean partials
+        // aren't affected; noise is, and this keeps the moved energy within the Born-rule share.
+        let model = spectrum[p].norm_sqr() / window_at(&pv.window, p as f32 - freq).norm_sqr();
+        let region: f32 = spectrum[start..=end].iter().map(|x| x.norm_sqr()).sum();
+        let amp = (model.min(region / WINDOW_ENERGY)).sqrt();
+        let c = octave(p);
+        for r in (0..u.dim).filter(|&r| r != c) {
+            let gain = u.cols[c][r].norm();
+            let to = freq * 2f32.powi(r as i32 - c as i32);
+            let target = to.round() as usize;
+            if gain == 0.0 || !(1..=TOP_BIN).contains(&target) {
+                continue;
+            }
+            let out = (pv.out_phase[target] + hop_phase * to).rem_euclid(TAU);
+            if gain * amp > pv.loudest[target] {
+                pv.loudest[target] = gain * amp;
+                pv.next_phase[target] = out;
+            }
+            let partial = Complex32::from_polar(gain * amp, out);
+            for k in target.saturating_sub(LOBE).max(1)..=(target + LOBE).min(TOP_BIN) {
+                pv.moved[k] += partial * window_at(&pv.window, k as f32 - to);
+            }
+        }
+        let stay = u.cols[c][c].norm();
+        pv.stay[start..=end].fill(stay);
+    }
+
+    for (k, bin) in spectrum.iter_mut().enumerate().take(TOP_BIN + 1).skip(1) {
+        let x = *bin;
+        pv.prev_phase[k] = x.arg();
+        let wet = x * pv.stay[k] + pv.moved[k];
+        *bin = x + (wet - x) * mix;
+    }
+    std::mem::swap(&mut pv.out_phase, &mut pv.next_phase);
+}
+
 /// Finds attacks from jumps in high-frequency content (bin-weighted energy) between frames.
 #[derive(Clone, Copy, Default)]
 struct Detector {
@@ -151,6 +333,7 @@ struct Tangle {
     /// In cycles of the drift rate
     drift_phase: f64,
     detectors: [Detector; 2],
+    vocoders: [Vocoder; 2],
 }
 
 #[derive(Params)]
@@ -158,6 +341,8 @@ struct TangleParams {
     #[persist = "editor-size"]
     editor_state: Arc<EguiState>,
 
+    #[id = "mode"]
+    mode: EnumParam<Mode>,
     #[id = "amount"]
     amount: FloatParam,
     #[id = "mix"]
@@ -193,6 +378,7 @@ impl Default for TangleParams {
     fn default() -> Self {
         Self {
             editor_state: EguiState::from_size(360, 330),
+            mode: EnumParam::new("Mode", Mode::Bands),
             amount: knob("Amount", 0.5),
             mix: knob("Mix", 1.0),
             // Steps between band sizes, so no smoother: each change jumps (crossfaded by the overlap)
@@ -264,6 +450,8 @@ impl Default for Tangle {
             unitary: Unitary::new(4, 0, &Angles::default()),
             drift_phase: 0.0,
             detectors: Default::default(),
+            // Both channels up front, so a mono layout needs nothing new in initialize()
+            vocoders: [Vocoder::new(), Vocoder::new()],
         }
     }
 }
@@ -278,6 +466,7 @@ impl Tangle {
         let (window, r2c, c2r, spectrum) = (&self.window, &self.r2c, &self.c2r, &mut self.spectrum);
         let (base, unitary) = (&self.base_angles, &mut self.unitary);
         let (drift_phase, detectors) = (&mut self.drift_phase, &mut self.detectors);
+        let vocoders = &mut self.vocoders;
         let mut s = Settings::default();
         self.stft
             .process_overlap_add(buffer, OVERLAP, |channel, frame| {
@@ -285,7 +474,8 @@ impl Tangle {
                 if channel == 0 {
                     s = next();
                     *drift_phase += (s.drift_rate * hop_seconds) as f64;
-                    unitary.build(s.qubits, s.layers, &s.angles(base, *drift_phase));
+                    let qubits = if s.octaves { OCTAVE_QUBITS } else { s.qubits };
+                    unitary.build(qubits, s.layers, &s.angles(base, *drift_phase));
                 }
                 for (x, w) in frame.iter_mut().zip(window) {
                     *x *= w;
@@ -294,11 +484,15 @@ impl Tangle {
                 // aren't mixed so they stay real
                 r2c.process_with_scratch(frame, spectrum, &mut []).unwrap();
                 let attack = detectors[channel].next(spectrum, decay);
-                let k_len = s.band_bins(unitary.dim);
-                let block = k_len * unitary.dim;
-                let mixed = TOP_BIN / block * block;
                 let mix = s.mix * (1.0 - s.transient * attack);
-                mix_bands(&mut spectrum[1..=mixed], unitary, k_len, mix);
+                if s.octaves {
+                    shift_octaves(spectrum, unitary, &mut vocoders[channel], mix);
+                } else {
+                    let k_len = s.band_bins(unitary.dim);
+                    let block = k_len * unitary.dim;
+                    let mixed = TOP_BIN / block * block;
+                    mix_bands(&mut spectrum[1..=mixed], unitary, k_len, mix);
+                }
                 c2r.process_with_scratch(spectrum, frame, &mut []).unwrap();
                 for (x, w) in frame.iter_mut().zip(window) {
                     *x *= w * gain;
@@ -372,6 +566,9 @@ impl Plugin for Tangle {
         self.stft.set_block_size(FFT_SIZE);
         self.drift_phase = 0.0;
         self.detectors = Default::default();
+        for pv in &mut self.vocoders {
+            pv.reset();
+        }
     }
 
     fn process(
@@ -385,6 +582,7 @@ impl Plugin for Tangle {
         self.run(buffer, || Settings {
             amount: p.amount.smoothed.next_step(step),
             mix: p.mix.smoothed.next_step(step),
+            octaves: p.mode.value() == Mode::Octaves,
             width: p.width.value(),
             qubits: p.qubits.value() as usize,
             layers: p.layers.value() as usize,
@@ -437,6 +635,11 @@ mod tests {
         drift: 0.0,
         drift_rate: 0.2,
         transient: 0.0,
+        octaves: false,
+    };
+    const OCTAVES: Settings = Settings {
+        octaves: true,
+        ..FULL
     };
 
     /// Runs `input` through the plugin as a host would, in uneven blocks that don't line up
@@ -507,6 +710,16 @@ mod tests {
                 ..busy
             },
             Settings { mix: 0.0, ..busy },
+            Settings {
+                amount: 0.0,
+                octaves: true,
+                ..busy
+            },
+            Settings {
+                mix: 0.0,
+                octaves: true,
+                ..busy
+            },
         ] {
             let output = render(&input, s);
             for (inp, out) in input.iter().zip(&output) {
@@ -578,6 +791,24 @@ mod tests {
             println!("output level, {name}: {db:+.2} dB");
             assert!(db.abs() < 1.0, "{name}: {db} dB");
         }
+        // Octaves mode only moves what looks like partials, so noise loses some of its moved
+        // share. It must never come out louder.
+        for (name, s) in [
+            ("octaves", OCTAVES),
+            (
+                "octaves, 4 layers, twisted",
+                Settings {
+                    layers: 4,
+                    twist: 0.7,
+                    ..OCTAVES
+                },
+            ),
+        ] {
+            let output = render(&input, s);
+            let db = 20.0 * (rms(&output[0][FFT_SIZE..]) / rms(&input[0])).log10();
+            println!("output level on noise, {name}: {db:+.2} dB");
+            assert!((-6.0..0.5).contains(&db), "{name}: {db} dB");
+        }
     }
 
     #[test]
@@ -633,5 +864,63 @@ mod tests {
         let (off, on) = (attack_error(0.0), attack_error(1.0));
         println!("attack error: {off:.4} without, {on:.4} with Transient Preserve");
         assert!(on < 0.5 * off, "{on} vs {off}");
+    }
+
+    /// Power of `x` at `freq` Hz (48 kHz), through a Hann window so nearby tones don't leak in
+    fn tone_power(x: &[f32], freq: f32) -> f32 {
+        let n = x.len() as f32;
+        let sum: Complex32 = x
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let w = 0.5 - 0.5 * (TAU * i as f32 / n).cos();
+                Complex32::from_polar(v * w, -TAU * freq * i as f32 / 48_000.0)
+            })
+            .sum();
+        sum.norm_sqr() / (n * n)
+    }
+
+    #[test]
+    fn octaves_mode_moves_partials_by_exact_octaves() {
+        let input: Vec<f32> = (0..96_000)
+            .map(|n| 0.5 * (TAU * 440.0 * n as f32 / 48_000.0).sin())
+            .collect();
+        let output = render(&[input.clone(), input.clone()], OCTAVES);
+        // Skip the latency and the vocoder settling in
+        let out = &output[0][FFT_SIZE + 8192..];
+        let sum = |freqs: &[f32]| freqs.iter().map(|&f| tone_power(out, f)).sum::<f32>();
+        let octaves = [110.0, 220.0, 880.0, 1760.0, 3520.0, 7040.0, 14080.0];
+        // A fifth off, and 35 cents off (where copies would land without the vocoder)
+        let fifths = octaves.map(|f| f * 1.5);
+        let detuned = octaves.map(|f| f * 2f32.powf(-35.0 / 1200.0));
+        // Each octave gets the Born-rule share |U[r][c]|² of the 440 Hz partial (octave c = 2)
+        let u = Unitary::new(
+            OCTAVE_QUBITS,
+            2,
+            &OCTAVES.angles(&Angles::random(SEED), 0.0),
+        );
+        let dry = tone_power(&input[FFT_SIZE + 8192..], 440.0);
+        for (r, f) in [110.0, 220.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0, 14080.0]
+            .into_iter()
+            .enumerate()
+        {
+            let (got, expect) = (tone_power(out, f), u.cols[2][r].norm_sqr() * dry);
+            println!("{f} Hz: {got:.3e}, expected {expect:.3e}");
+            assert!(
+                (got - expect).abs() < 0.02 * expect + 1e-9,
+                "{f} Hz: {got} vs {expect}"
+            );
+        }
+        let (on, off, flat) = (sum(&octaves), sum(&fifths), sum(&detuned));
+        println!("octave copies {on:.2e}, at fifths {off:.2e}, 35 cents flat {flat:.2e}");
+        assert!(on > 1e-4, "nothing moved: {on}");
+        assert!(on > 100.0 * off, "{on} vs fifths {off}");
+        assert!(on > 10.0 * flat, "{on} vs detuned {flat}");
+        // Tonal input keeps its level: the vocoder keeps moved partials phase-coherent. (Noise
+        // has no stable partials, so its moved share adds incoherently and loses up to ~4 dB.)
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        let db = 20.0 * (rms(out) / (0.5 / 2f32.sqrt())).log10();
+        println!("output level, octaves on a sine: {db:+.2} dB");
+        assert!(db.abs() < 1.0, "{db} dB");
     }
 }

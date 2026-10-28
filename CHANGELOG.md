@@ -6,6 +6,12 @@ All notable changes to Tangle are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Mode: Octaves. The circuit tangles each partial with its own octaves (8 octaves from about
+  94 Hz up) instead of mixing frequency bands: a harmonic shimmer rather than a ring modulator.
+  A phase vocoder keeps the octave copies exactly in tune. Bands, the default, sounds the same as
+  0.1.0.
+
 ## [0.1.0] - 2026-10-27
 
 ### Added

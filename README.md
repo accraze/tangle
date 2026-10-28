@@ -9,10 +9,11 @@ push it for drifting, metallic, frequency-shifted textures.
 
 | Control | Range | What it does |
 |---------|-------|--------------|
+| Mode    | Bands / Octaves | What gets tangled: blocks of frequency bands, or each partial's octaves (see below) |
 | Amount  | 0–100% | How far the circuit's gates rotate. 0% is exactly transparent |
 | Mix     | 0–100% | Dry/wet |
-| Width   | 0–100% | Band size. Low settings use narrow bands (about 100–200 Hz) in small groups repeated up the spectrum, so energy moves in fine steps within a few kHz: a blur. High settings use bands over a kHz wide: bigger, more metallic jumps. Default 20% |
-| Qubits  | 3–5 | Number of bands that get mixed together: 8, 16 or 32 |
+| Width   | 0–100% | (Bands) Band size. Low settings use narrow bands (about 100–200 Hz) in small groups repeated up the spectrum, so energy moves in fine steps within a few kHz: a blur. High settings use bands over a kHz wide: bigger, more metallic jumps. Default 20% |
+| Qubits  | 3–5 | (Bands) Number of bands that get mixed together: 8, 16 or 32. Octaves mode always uses 3 |
 | Layers  | 1–4 | Depth of the circuit. More layers tangle the bands more thoroughly |
 | Twist   | ±100% | Offsets every gate angle: a "different circuit" knob |
 | Coupling | 0–100% | Strength of the entangling gates. At 0% the qubits rotate independently |
@@ -46,6 +47,22 @@ The GUI is nih-plug's generic sliders for now.
 What you hear: each partial gets copied, at various strengths and phases, to its counterparts in
 the other bands, which are shifted in frequency by whole bands. With narrow bands that's a dense
 cloud of copies in fine frequency steps around every note; Drift keeps it moving.
+
+### Octaves mode
+
+Here the 3 qubits index 8 octaves, from about 94 Hz up to the top of the spectrum (at 48 kHz),
+and U moves energy between a partial and its octaves instead of between bands. That's harmonic, so
+it sounds like a shimmer rather than a ring modulator.
+
+- Each spectral peak is treated as a partial. A phase vocoder measures its exact frequency.
+- |U[r][c]|² is the share of a partial's energy that moves from octave c to octave r: the Born
+  rule, the probability of measuring the circuit in state r. Because U is unitary, the shares
+  from each octave add up to exactly 1, so energy is still conserved.
+- The share that stays keeps its original bins (so Amount 0 is still exactly transparent). The
+  shares that move are redrawn at exactly 2, 4, ½... times the partial's frequency, with their
+  phase carried from frame to frame, so the copies are in tune.
+- Only peaks move, so noisy content (pick noise, string squeak) loses a little of its moved
+  share instead of being shifted. It never comes out louder.
 
 There's no quantum hardware or quantum speed-up involved. The circuit is a compact way to build
 a family of unitary matrices with a handful of musical knobs.

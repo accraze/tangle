@@ -35,6 +35,13 @@ cargo clippy --release --workspace --lib
 - Band size (`Settings::band_bins`) must stay a multiple of `OVERLAP`: otherwise moved bins lose phase coherence
   across hops and the output drops ~4 dB (`output_level_stays_close` catches it). Never mix DC or Nyquist (bin
   1024): they must stay real or the inverse FFT's `unwrap()` panics.
+- Octaves mode (`shift_octaves`): 3 qubits, U's index = octave of bins `OCTAVE_BASE·2^b..`. Peaks are partials;
+  |U[r][c]|² of each moves to `freq·2^(r-c)` and is redrawn from the window's spectrum (`window_response`, tabled
+  in `Vocoder::window` because the closed form costs 5x the CPU). Pitfalls the tests caught, keep them fixed:
+  shifting lobes by whole bins detunes copies; a target bin's `out_phase` must be owned by its loudest partial
+  (noise-floor peaks otherwise detune loud ones); the frequency estimate is clamped to ±0.5 bin and each copy's
+  energy capped at its region's, or noise comes out 14 dB louder. `octaves_mode_moves_partials_by_exact_octaves`
+  checks every octave's share against |U|², and the noise level check must stay below 0 dB.
 - The tests drive `run()` through a hand-built `Buffer` with stereo input, because `StftHelper` is sized for 2
   channels by default (mono only comes from `initialize()`).
 - The audio thread must not allocate (`assert_process_allocs` is enabled).
