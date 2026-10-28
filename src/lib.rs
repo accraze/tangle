@@ -196,7 +196,7 @@ impl Default for TangleParams {
             amount: knob("Amount", 0.5),
             mix: knob("Mix", 1.0),
             // Steps between band sizes, so no smoother: each change jumps (crossfaded by the overlap)
-            width: knob("Width", 1.0).with_smoother(SmoothingStyle::None),
+            width: knob("Width", 0.2).with_smoother(SmoothingStyle::None),
             qubits: IntParam::new(
                 "Qubits",
                 4,
