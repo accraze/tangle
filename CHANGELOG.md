@@ -6,6 +6,14 @@ All notable changes to Tangle are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Spread: morphs the right channel toward its own circuit, so a mono source comes out wide.
+  Each side is still energy-preserving, and 0% (the default) sounds the same as 0.2.0.
+
+### Fixed
+- Octaves mode could come out up to about 1 dB louder on dense material with some circuits.
+  Each frame is now capped at its input energy.
+
 ## [0.2.0] - 2026-10-27
 
 ### Added

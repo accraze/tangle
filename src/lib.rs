@@ -72,6 +72,8 @@ struct Settings {
     /// Hz
     drift_rate: f32,
     transient: f32,
+    /// 0 = both channels share one circuit, 1 = the right channel runs an unrelated one
+    spread: f32,
     /// Octaves mode instead of Bands
     octaves: bool,
 }
@@ -102,6 +104,19 @@ impl Settings {
         let units = (max as f32).powf(self.width).round() as usize;
         units.clamp(1, max) * OVERLAP
     }
+}
+
+/// `a` moved toward `b` by `t`, so Spread morphs smoothly from one circuit to the other
+fn blend(a: &Angles, b: &Angles, t: f32) -> Angles {
+    let mut out = *a;
+    for l in 0..MAX_LAYERS {
+        for q in 0..MAX_QUBITS {
+            out.ry[l][q] += (b.ry[l][q] - a.ry[l][q]) * t;
+            out.rz[l][q] += (b.rz[l][q] - a.rz[l][q]) * t;
+            out.ent[l][q] += (b.ent[l][q] - a.ent[l][q]) * t;
+        }
+    }
+    out
 }
 
 /// A sine LFO per gate, each at its own rate (0.5x to 1.5x the drift rate) and phase, spread by
@@ -287,10 +302,28 @@ fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix:
         pv.stay[start..=end].fill(stay);
     }
 
+    // Copies landing on each other can add up in phase (noise moved down an octave piles into half
+    // as many bins), so cap the frame at its input energy: Octaves mode must never get louder
+    let (mut dry_energy, mut wet_energy) = (0.0, 0.0);
+    for ((x, stay), moved) in spectrum
+        .iter()
+        .zip(&pv.stay)
+        .zip(&pv.moved)
+        .take(TOP_BIN + 1)
+        .skip(1)
+    {
+        dry_energy += x.norm_sqr();
+        wet_energy += (x * stay + moved).norm_sqr();
+    }
+    let cap = if wet_energy > dry_energy {
+        (dry_energy / wet_energy).sqrt()
+    } else {
+        1.0
+    };
     for (k, bin) in spectrum.iter_mut().enumerate().take(TOP_BIN + 1).skip(1) {
         let x = *bin;
         pv.prev_phase[k] = x.arg();
-        let wet = x * pv.stay[k] + pv.moved[k];
+        let wet = (x * pv.stay[k] + pv.moved[k]) * cap;
         *bin = x + (wet - x) * mix;
     }
     std::mem::swap(&mut pv.out_phase, &mut pv.next_phase);
@@ -328,8 +361,9 @@ struct Tangle {
     r2c: Arc<dyn RealToComplex<f32>>,
     c2r: Arc<dyn ComplexToReal<f32>>,
     spectrum: Vec<Complex32>,
-    base_angles: Angles,
-    unitary: Unitary,
+    /// Left (and mono), and the circuit Spread morphs the right channel toward
+    base_angles: [Angles; 2],
+    unitaries: [Unitary; 2],
     /// In cycles of the drift rate
     drift_phase: f64,
     detectors: [Detector; 2],
@@ -363,6 +397,8 @@ struct TangleParams {
     drift_rate: FloatParam,
     #[id = "transient"]
     transient: FloatParam,
+    #[id = "spread"]
+    spread: FloatParam,
 }
 
 fn knob(name: &str, default: f32) -> FloatParam {
@@ -427,6 +463,8 @@ impl Default for TangleParams {
             .with_unit(" Hz")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
             transient: knob("Transient Preserve", 0.5),
+            // 0 so projects saved before Spread existed sound the same
+            spread: knob("Spread", 0.0),
         }
     }
 }
@@ -446,8 +484,8 @@ impl Default for Tangle {
             spectrum: r2c.make_output_vec(),
             c2r: planner.plan_fft_inverse(FFT_SIZE),
             r2c,
-            base_angles: Angles::random(SEED),
-            unitary: Unitary::new(4, 0, &Angles::default()),
+            base_angles: [Angles::random(SEED), Angles::random(SEED + 1)],
+            unitaries: std::array::from_fn(|_| Unitary::new(4, 0, &Angles::default())),
             drift_phase: 0.0,
             detectors: Default::default(),
             // Both channels up front, so a mono layout needs nothing new in initialize()
@@ -464,19 +502,25 @@ impl Tangle {
         let hop_seconds = HOP as f32 / self.sample_rate;
         let decay = (-hop_seconds / TRANSIENT_RELEASE).exp();
         let (window, r2c, c2r, spectrum) = (&self.window, &self.r2c, &self.c2r, &mut self.spectrum);
-        let (base, unitary) = (&self.base_angles, &mut self.unitary);
+        let (bases, unitaries) = (&self.base_angles, &mut self.unitaries);
         let (drift_phase, detectors) = (&mut self.drift_phase, &mut self.detectors);
         let vocoders = &mut self.vocoders;
         let mut s = Settings::default();
         self.stft
             .process_overlap_add(buffer, OVERLAP, |channel, frame| {
-                // Channels come in order for each frame, and all share one U
+                // Channels come in order for each frame
                 if channel == 0 {
                     s = next();
                     *drift_phase += (s.drift_rate * hop_seconds) as f64;
-                    let qubits = if s.octaves { OCTAVE_QUBITS } else { s.qubits };
-                    unitary.build(qubits, s.layers, &s.angles(base, *drift_phase));
                 }
+                let base = blend(
+                    &bases[0],
+                    &bases[1],
+                    if channel == 0 { 0.0 } else { s.spread },
+                );
+                let qubits = if s.octaves { OCTAVE_QUBITS } else { s.qubits };
+                let unitary = &mut unitaries[channel];
+                unitary.build(qubits, s.layers, &s.angles(&base, *drift_phase));
                 for (x, w) in frame.iter_mut().zip(window) {
                     *x *= w;
                 }
@@ -591,6 +635,7 @@ impl Plugin for Tangle {
             drift: p.drift.smoothed.next_step(step),
             drift_rate: p.drift_rate.value(),
             transient: p.transient.smoothed.next_step(step),
+            spread: p.spread.smoothed.next_step(step),
         });
         ProcessStatus::Normal
     }
@@ -635,6 +680,7 @@ mod tests {
         drift: 0.0,
         drift_rate: 0.2,
         transient: 0.0,
+        spread: 0.0,
         octaves: false,
     };
     const OCTAVES: Settings = Settings {
@@ -702,6 +748,7 @@ mod tests {
             drift: 1.0,
             drift_rate: 2.0,
             transient: 1.0,
+            spread: 1.0,
             ..FULL
         };
         for s in [
@@ -864,6 +911,43 @@ mod tests {
         let (off, on) = (attack_error(0.0), attack_error(1.0));
         println!("attack error: {off:.4} without, {on:.4} with Transient Preserve");
         assert!(on < 0.5 * off, "{on} vs {off}");
+    }
+
+    #[test]
+    fn spread_gives_each_channel_its_own_circuit() {
+        let x = noise(48_000, 9);
+        let input = vec![x.clone(), x];
+        for base in [FULL, OCTAVES] {
+            let same = render(&input, base);
+            assert_eq!(
+                same[0], same[1],
+                "Spread 0 must keep the channels identical"
+            );
+            let spread = render(
+                &input,
+                Settings {
+                    spread: 1.0,
+                    ..base
+                },
+            );
+            assert_eq!(
+                spread[0], same[0],
+                "Spread must leave the left channel alone"
+            );
+            let (l, r) = (&spread[0][FFT_SIZE..], &spread[1][FFT_SIZE..]);
+            let diff: Vec<f32> = l.iter().zip(r).map(|(a, b)| a - b).collect();
+            let side = rms(&diff) / rms(l);
+            let db = 20.0 * (rms(r) / rms(&input[1])).log10();
+            println!("spread 100%: side/left {side:.2}, right channel {db:+.2} dB");
+            assert!(side > 0.5, "channels barely differ: {side}");
+            // Same bounds as output_level_stays_close
+            let ok = if base.octaves {
+                (-6.0..0.5).contains(&db)
+            } else {
+                db.abs() < 1.0
+            };
+            assert!(ok, "right channel level {db} dB");
+        }
     }
 
     /// Power of `x` at `freq` Hz (48 kHz), through a Hann window so nearby tones don't leak in
