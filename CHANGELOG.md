@@ -6,6 +6,8 @@ All notable changes to Tangle are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-27
+
 ### Added
 - Mode: Octaves. The circuit tangles each partial with its own octaves (8 octaves from about
   94 Hz up) instead of mixing frequency bands: a harmonic shimmer rather than a ring modulator.
@@ -24,5 +26,6 @@ All notable changes to Tangle are documented here. The format follows
 - Reports 2048 samples of latency (43 ms at 48 kHz).
 - Generic slider GUI.
 
-[Unreleased]: https://github.com/accraze/tangle/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/accraze/tangle/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/accraze/tangle/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/accraze/tangle/releases/tag/v0.1.0
