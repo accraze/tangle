@@ -6,6 +6,8 @@ All notable changes to Tangle are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
 ### Added
 - Spread: morphs the right channel toward its own circuit, so a mono source comes out wide.
   Each side is still energy-preserving, and 0% (the default) sounds the same as 0.2.0.
@@ -34,6 +36,7 @@ All notable changes to Tangle are documented here. The format follows
 - Reports 2048 samples of latency (43 ms at 48 kHz).
 - Generic slider GUI.
 
-[Unreleased]: https://github.com/accraze/tangle/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/accraze/tangle/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/accraze/tangle/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/accraze/tangle/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/accraze/tangle/releases/tag/v0.1.0
