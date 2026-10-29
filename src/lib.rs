@@ -76,6 +76,8 @@ struct Settings {
     spread: f32,
     /// Octaves mode instead of Bands
     octaves: bool,
+    /// Octaves mode: furthest a partial can move, in octaves (1..=7)
+    span: usize,
 }
 
 impl Settings {
@@ -240,7 +242,10 @@ fn octave(bin: usize) -> usize {
 ///
 /// shortcut: only peaks move, so the moved share of noisy, non-peak content (pick noise, breath)
 /// is dropped rather than moved; split off a residual and shift it too if that's audible.
-fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix: f32) {
+///
+/// Only octaves within `span` of a partial's own get a share. The kept shares are scaled up so they
+/// still sum to 1, which keeps the energy and leaves the circuit's proportions between them intact.
+fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix: f32, span: usize) {
     // Phase a bin-centred partial advances per hop, per bin of frequency
     let hop_phase = TAU * HOP as f32 / FFT_SIZE as f32;
     pv.moved.fill(Complex32::new(0.0, 0.0));
@@ -281,8 +286,19 @@ fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix:
         let region: f32 = spectrum[start..=end].iter().map(|x| x.norm_sqr()).sum();
         let amp = (model.min(region / WINDOW_ENERGY)).sqrt();
         let c = octave(p);
-        for r in (0..u.dim).filter(|&r| r != c) {
-            let gain = u.cols[c][r].norm();
+        let reach = |r: usize| r.abs_diff(c) <= span;
+        let kept: f32 = (0..u.dim)
+            .filter(|&r| reach(r))
+            .map(|r| u.cols[c][r].norm_sqr())
+            .sum();
+        // kept > 0 unless the circuit sends this octave entirely out of reach; then leave it be
+        let scale = if kept > 1e-12 {
+            kept.sqrt().recip()
+        } else {
+            0.0
+        };
+        for r in (0..u.dim).filter(|&r| r != c && reach(r)) {
+            let gain = u.cols[c][r].norm() * scale;
             let to = freq * 2f32.powi(r as i32 - c as i32);
             let target = to.round() as usize;
             if gain == 0.0 || !(1..=TOP_BIN).contains(&target) {
@@ -298,7 +314,11 @@ fn shift_octaves(spectrum: &mut [Complex32], u: &Unitary, pv: &mut Vocoder, mix:
                 pv.moved[k] += partial * window_at(&pv.window, k as f32 - to);
             }
         }
-        let stay = u.cols[c][c].norm();
+        let stay = if scale > 0.0 {
+            u.cols[c][c].norm() * scale
+        } else {
+            1.0
+        };
         pv.stay[start..=end].fill(stay);
     }
 
@@ -399,6 +419,8 @@ struct TangleParams {
     transient: FloatParam,
     #[id = "spread"]
     spread: FloatParam,
+    #[id = "span"]
+    span: IntParam,
 }
 
 fn knob(name: &str, default: f32) -> FloatParam {
@@ -465,6 +487,16 @@ impl Default for TangleParams {
             transient: knob("Transient Preserve", 0.5),
             // 0 so projects saved before Spread existed sound the same
             spread: knob("Spread", 0.0),
+            // 7 reaches every octave, the 0.3.0 sound
+            span: IntParam::new("Octave Span", 7, IntRange::Linear { min: 1, max: 7 })
+                .with_value_to_string(Arc::new(|n| format!("±{n} oct")))
+                .with_string_to_value(Arc::new(|s| {
+                    s.trim_start_matches('±')
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })),
         }
     }
 }
@@ -530,7 +562,7 @@ impl Tangle {
                 let attack = detectors[channel].next(spectrum, decay);
                 let mix = s.mix * (1.0 - s.transient * attack);
                 if s.octaves {
-                    shift_octaves(spectrum, unitary, &mut vocoders[channel], mix);
+                    shift_octaves(spectrum, unitary, &mut vocoders[channel], mix, s.span);
                 } else {
                     let k_len = s.band_bins(unitary.dim);
                     let block = k_len * unitary.dim;
@@ -636,6 +668,7 @@ impl Plugin for Tangle {
             drift_rate: p.drift_rate.value(),
             transient: p.transient.smoothed.next_step(step),
             spread: p.spread.smoothed.next_step(step),
+            span: p.span.value() as usize,
         });
         ProcessStatus::Normal
     }
@@ -682,6 +715,7 @@ mod tests {
         transient: 0.0,
         spread: 0.0,
         octaves: false,
+        span: 7,
     };
     const OCTAVES: Settings = Settings {
         octaves: true,
@@ -749,6 +783,7 @@ mod tests {
             drift_rate: 2.0,
             transient: 1.0,
             spread: 1.0,
+            span: 1,
             ..FULL
         };
         for s in [
@@ -842,6 +877,7 @@ mod tests {
         // share. It must never come out louder.
         for (name, s) in [
             ("octaves", OCTAVES),
+            ("octaves, span 1", Settings { span: 1, ..OCTAVES }),
             (
                 "octaves, 4 layers, twisted",
                 Settings {
@@ -969,6 +1005,38 @@ mod tests {
         let input: Vec<f32> = (0..96_000)
             .map(|n| 0.5 * (TAU * 440.0 * n as f32 / 48_000.0).sin())
             .collect();
+        // Each octave gets the Born-rule share |U[r][c]|² of the 440 Hz partial (octave c = 2)
+        let u = Unitary::new(
+            OCTAVE_QUBITS,
+            2,
+            &OCTAVES.angles(&Angles::random(SEED), 0.0),
+        );
+        let dry = tone_power(&input[FFT_SIZE + 8192..], 440.0);
+        // Octave Span 1 only keeps 220 and 880 Hz, rescaled so the shares still sum to 1
+        for span in [7, 1] {
+            let output = render(
+                &[input.clone(), input.clone()],
+                Settings { span, ..OCTAVES },
+            );
+            let out = &output[0][FFT_SIZE + 8192..];
+            let kept: f32 = (1..=3).map(|r| u.cols[2][r].norm_sqr()).sum();
+            for (r, f) in [110.0, 220.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0, 14080.0]
+                .into_iter()
+                .enumerate()
+            {
+                let share = match span {
+                    7 => u.cols[2][r].norm_sqr(),
+                    _ if r.abs_diff(2) <= 1 => u.cols[2][r].norm_sqr() / kept,
+                    _ => 0.0,
+                };
+                let (got, expect) = (tone_power(out, f), share * dry);
+                println!("span {span}, {f} Hz: {got:.3e}, expected {expect:.3e}");
+                assert!(
+                    (got - expect).abs() < 0.02 * expect + 1e-6 * dry,
+                    "span {span}, {f} Hz: {got} vs {expect}"
+                );
+            }
+        }
         let output = render(&[input.clone(), input.clone()], OCTAVES);
         // Skip the latency and the vocoder settling in
         let out = &output[0][FFT_SIZE + 8192..];
@@ -977,24 +1045,6 @@ mod tests {
         // A fifth off, and 35 cents off (where copies would land without the vocoder)
         let fifths = octaves.map(|f| f * 1.5);
         let detuned = octaves.map(|f| f * 2f32.powf(-35.0 / 1200.0));
-        // Each octave gets the Born-rule share |U[r][c]|² of the 440 Hz partial (octave c = 2)
-        let u = Unitary::new(
-            OCTAVE_QUBITS,
-            2,
-            &OCTAVES.angles(&Angles::random(SEED), 0.0),
-        );
-        let dry = tone_power(&input[FFT_SIZE + 8192..], 440.0);
-        for (r, f) in [110.0, 220.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0, 14080.0]
-            .into_iter()
-            .enumerate()
-        {
-            let (got, expect) = (tone_power(out, f), u.cols[2][r].norm_sqr() * dry);
-            println!("{f} Hz: {got:.3e}, expected {expect:.3e}");
-            assert!(
-                (got - expect).abs() < 0.02 * expect + 1e-9,
-                "{f} Hz: {got} vs {expect}"
-            );
-        }
         let (on, off, flat) = (sum(&octaves), sum(&fifths), sum(&detuned));
         println!("octave copies {on:.2e}, at fifths {off:.2e}, 35 cents flat {flat:.2e}");
         assert!(on > 1e-4, "nothing moved: {on}");

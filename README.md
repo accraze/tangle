@@ -21,6 +21,7 @@ push it for drifting, metallic, frequency-shifted textures.
 | Drift Rate | 0.01–2 Hz | How fast Drift moves |
 | Transient Preserve | 0–100% | Pulls the effect back on pick attacks, so the transient stays intact, then lets go over 100 ms |
 | Spread  | 0–100% | Morphs the right channel toward a different circuit: a mono guitar comes out wide. 0% = both sides identical |
+| Octave Span | ±1–7 oct | Octaves mode only: how far a partial can move. ±1–2 is the classic shimmer range; ±7 (the default) lets the circuit send energy anywhere |
 
 Tangle reports 2048 samples of latency (43 ms at 48 kHz), which hosts compensate for. Width,
 Qubits and Layers switch between discrete settings, so automating them jumps rather than glides.

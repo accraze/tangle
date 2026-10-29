@@ -42,6 +42,8 @@ cargo clippy --release --workspace --lib
   (noise-floor peaks otherwise detune loud ones); the frequency estimate is clamped to ±0.5 bin and each copy's
   energy capped at its region's, or noise comes out 14 dB louder. `octaves_mode_moves_partials_by_exact_octaves`
   checks every octave's share against |U|², and the noise level check must stay below 0 dB.
+  Octave Span drops shares more than `span` octaves away and rescales the rest by 1/sqrt(kept) so
+  each column still sums to 1. Each frame is also capped at its input energy (copies can pile up in phase).
 - The tests drive `run()` through a hand-built `Buffer` with stereo input, because `StftHelper` is sized for 2
   channels by default (mono only comes from `initialize()`).
 - The audio thread must not allocate (`assert_process_allocs` is enabled).

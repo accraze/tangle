@@ -6,6 +6,10 @@ All notable changes to Tangle are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Octave Span (Octaves mode): limits how far a partial can move, from ±1 to ±7 octaves. The
+  shares within reach are scaled up so the level holds. ±7, the default, sounds the same as 0.3.0.
+
 ## [0.3.0] - 2026-10-28
 
 ### Added
